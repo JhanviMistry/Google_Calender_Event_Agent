@@ -16,9 +16,9 @@ from google.genai import types
 from google.adk.agents import Agent
 
 MODEL = "gemini-2.0-flash-001"
-SCOPES = ["https://www.googleapis.com/auth/calender"]
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-def get_calendar_service(): #for connection with google calender
+def get_calendar_service(): #for connection with google calendar
     creds = None
     if os.path.exists("token.json"):
         try:
@@ -37,7 +37,7 @@ def get_calendar_service(): #for connection with google calender
         with open("token.json", "w", encoding = "utf-8") as token:
             token.write(creds.to_json()) 
 
-    return build("calender", "v3", credentials = creds) #creates and returns calender API service
+    return build("calendar", "v3", credentials = creds) #creates and returns calendar API service
         
 
 #detect user's timezone if not detected return GMT (Greenwich Mean Time)  
@@ -312,10 +312,10 @@ def parsed_recurrence(recurrence_string: str) -> str:
     raise ValueError(f"couldn't parse recurrence string: {recurrence_string}")
 
 # This function retrives the event
-def get_event(event_id: str, calender_id: str = "primary"):
+def get_event(event_id: str, calendar_id: str = "primary"):
     service = get_calendar_service()
     try:
-        event = service.event().get(calenderId = calender_id, eventId = event_id)
+        event = service.event().get(calendarId = calendar_id, eventId = event_id)
     except HttpError as error:
         raise ValueError(f"Failed to fetch event: {str(error)}")
 
@@ -328,7 +328,7 @@ def update_event(
     description: str = "",
     recurrence: Optional[str] = None,
     attendees: Optional[List[str, str]] = None,
-    calender_id: str = "primary",
+    calendar_id: str = "primary",
     send_update: str = "None" # "externalOnly", "all", "none"
 ) -> str:
     service = get_calendar_service()
@@ -354,7 +354,7 @@ def update_event(
 
     try:
         updatedevent = service.event().patch(
-            calenderId = calender_id,
+            calendarId = calendar_id,
             eventId = event_id,
             body = update_event_body,
             sendUpdates = send_update
@@ -363,14 +363,14 @@ def update_event(
     except HttpError as error:
         raise ValueError(f"Couldn't update event: {str(error)}")
 
-def delete_event(event_id: str, calender_id: str = "primary", send_updates: str = None) -> str:
+def delete_event(event_id: str, calendar_id: str = "primary", send_updates: str = None) -> str:
     service = get_calendar_service()
     try:
-        detetedevent = service.event().delete(
-            calenderId = calender_id,
+        service.event().delete(
+            calendarId = calendar_id,
             eventId = event_id,
             sendUpdates = send_updates
-            ).execute
+            ).execute()
         return f"Event deleted successfully."
     except HttpError as error:
         raise ValueError(f"Couldn't delete event: {str(error)}")
@@ -381,21 +381,21 @@ def meeting_time_suggestions(
     datetime_str: str,
     duration: Optional[str] = "1 hour",
     prefered_time: Optional[str] = None,
-    calender_id: str = "primary",
+    calendar_id: str = "primary",
     max_suggestions: int = 3
 ) -> List[str]:
     '''
-    This function will suggest available meeting times by analysing the calender status for bandwidth
+    This function will suggest available meeting times by analysing the calendar status for bandwidth
 
     Arguments:
         date_string: natural language target date string (eg: "Next Monday").
         duration: meeting duration (eg: "1 hour", "30 minutes").
         prefered_time: Optional time frame preference (eg. "in the morning", "10 AM to 3 PM"). 
-        calender_id: calender ID (default: "primary").
+        calendar_id: calendar ID (default: "primary").
         max_suggestions: Maximum number of suggested available slots.
 
     Return:
-        List of formatted time slots in local time zone (e.g., "2025-09-23 10:00 AM IST").
+        List of formatted time slots in local time zone (e.g., "2025-09-23 10:00 AM UTC").
         '''
 
     service = get_calendar_service()
@@ -416,6 +416,123 @@ def meeting_time_suggestions(
     day_end = day_start +datetime.timedelta(days = 1)
 
     duration_minutes = parse_duration(duration)
+
+    #Query for free/bust status
+
+    body = {
+        "minTime": day_start.astimezone(pytz.UTC).isoformat(),
+        "maxTime": day_end.astimezone(pytz.UTC).isoformat(),
+        "items": [{"id": calendar_id}]
+    }
+
+    try:
+        freebusy = service.freebusy().query(body = body).execute()
+        busy_sch = freebusy.get("calendars", {}).get(calendar_id, {}).get("busy", [])
+    except HttpError as error:
+        raise ValueError(f"Couldn't query free/busy calendar status : {str(error)}")
+    
+    # convert the busy slots into user's timezone
+    busy_slots = []
+    for sch in busy_sch:
+        start = datetime.datetime.fromisoformat(sch["start"].replace('Z', '+00:00')).astimezone(user_tz)
+        end = datetime.datetime.fromisoformat(sch["end"].replace('Z', '+00:00')).astimezone(user_tz)
+        busy_slots.append((start, end))
+
+    # find free slots
+    free_slots = []
+    current_time = day_start # free slot start time
+    while (current_time + datetime.timedelta(minutes = duration_minutes)) <= day_end:
+           free_end = datetime.timedelta(minutes = duration_minutes) #free slot end time
+           is_free = True #assume the slots are free
+           for busy_start, busy_end in busy_slots:
+               if not (free_end <= busy_start or current_time >= busy_end):
+                   is_free = False
+                   break
+           if is_free and (not time_frame or (time_frame[0] <= current_time.time() <= time_frame[1])):
+               free_slots.append(current_time)
+            
+           current_time += datetime.timedelta(minutes = 30) #if the block doesn't fits shift to next 30 minutes
+
+           if not free_slots:
+               return [f"No available slots found for a meeting of {duration} on {day_start.strftime('%d-%m-%y')}. Would you like suggestions for different day and duration."]
+        
+           formatted_slots = []
+           for slot in free_slots[:max_suggestions]:
+               slot_end = slot + datetime.timedelta(minutes = duration_minutes)
+               formatted_slots.append(f"{slot.strftime('%d-%m-%y %I:%M %p %z')} - {slot_end.strftime('%I:%M %p %z')}")
+           return formatted_slots
+    
+#promt engineering               
+agent_instructions = """
+You are a helpful, intelegent and precise calendar assistant that operates in the user's timezone
+
+Event Search and Querying Instructions:
+When the user asks to search or query events:
+- Use 'search_events' with query that contains keywords, min_time/max_time (parsed via 'natural_language_datetime_parser')
+- Display results in local TZ, including event ID for reference
+- If no results are found, say so politely.
+- for the resulting events use 'list_events'.
+
+Event Creation Instructions:
+When the user wants to craete an event
+- Collect important details: title, start time, end time/duration.
+- Use 'natural_language_datetime_parser' to parse the dates/times/durations into ISO format
+- Location and decription are optional, include only if they are pprovided.
+- For recurring events, parse recurrence (e.g., "every Tuesday for 5 weeks") using 'parse_recurrence' and pass as RRULE string.
+- For attendees, parse emails (e.g., "invite (e.g., "invite bob@example.com and alice@example.com"))as list of dicts [{"email": "bob@example.com}, {"email": "alice@example.com"}].
+- Call 'create_event' with parsed values including recurrence and attendes if provided.
+- Respond with confirmation, title/time in local TZ, and link.
+
+Event Updating/Editing Instructios:
+When the user wants to update or edit an event:
+- Identify the event: Use 'search_events'  or 'get_events' if ID is known.
+- Ask for clarification if multiple matches or ambiguous.
+- Use 'natural_language_datetime_parser' if updating times/duration.
+- For updating recurrence or attendees, parse and pass as in creation.
+- call 'update_event' with the event ID and only changed fields (pass None for unchanged), including recurrence or attendees.
+- Set 'send_updates' to all if attendees might be affected, else "none".
+- Respond with confirmation and updated details in local TZ.
+
+Event Deletion Instructions:
+When the user wants to delete an event:
+- Identify the event: Use 'search_events' to find the enevnt ID.
+- Confirm with the user if needed (.g., show details via 'get_event')
+- Call 'delete-event' with the event ID.
+- Set 'send_updates' to "all" if notifying others, else "none".
+- Respond with confirmation.
+
+Meeting time suggestions Instructions:
+When the user asks to suggest meeting times (e.g. "Suggest a time for meeting next Monday").
+- Use the 'meeting_time_suggestions' with the target date, duration, and optional time preference (e.g., "morning", "9 AM to 2 PM").
+- Parse inputs using 'natural_language_datetime' to get the date and duration.
+- Return 2-3 free time slots in local TZ (e.g., UTC).
+- If no slots are available, suggest alternative days or duration.
+- Offer to create an event with the chosen slot (e.g., "Shall I schedule the meeting at 2 PM?").
+- Example: "Suggest a 1-hour meeting next Monday morning" returns slots like "2026-02-02 10:00 AM UTC - 11:00 AM UTC".
+
+General Instructions:
+- Always use local time zone (e.g., IST) for inputs/outputs, Coverts to UTC for API.
+- For "next [day]" (e.g., "next friday"), interpret as next occurrence.
+- If event ID is unknown for update/delete, search first.
+- Handle ambiguities by asking questions.
+- Keep responses short, user-friendly: no raw JSON.
+- Priotize clarity and correctness.
+"""
+
+agent = Agent(
+    model = MODEL,
+    name = "google-calendar-event-agent",
+    description = "An intelligent assistant that lets you manage your Google Calendar using plain language, including scheduling recurring meetings with attendees, editing or removing events, searching your calendar, and proposing suitable meeting times in your local time zone." + agent_instructions,
+    generate_content_config = types.generateContentConfig(temperature = 0.2),
+    tools = [search_events, list_events, natural_language_datetime_parser, create_event, get_event, delete_event, parsed_recurrence, meeting_time_suggestions]
+)
+
+
+               
+               
+
+
+
 
     
 
