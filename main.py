@@ -7,10 +7,10 @@ import pytz
 from tzlocal import get_localzone
 from typing import Optional, List, Dict
 
-from google_auth_transports_requests import Request
-from google_oauth2_credentials import Credentials
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.errors import Httperror
+from googleapiclient.errors import HttpError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.genai import types
 from google.adk.agents import Agent
@@ -31,7 +31,7 @@ def get_calendar_service(): #for connection with google calendar
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json")
+            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
             creds = flow.run_local_server(port=0)
 
         with open("token.json", "w", encoding = "utf-8") as token:
@@ -51,8 +51,8 @@ def get_user_timezone() -> str:
 
 def search_events(
         query: Optional[str] = None,
-        min_time: Optional[str] = None,
-        max_time: Optional[str] = None,
+        timeMin: Optional[str] = None,
+        timeMax: Optional[str] = None,
         max_results: int = 10,
         calendar_id: str = "primary"
 ) -> List[str]:
@@ -65,10 +65,10 @@ def search_events(
     }
     if query:
         params["q"] = query
-    if min_time:
-        params["timeMin"] = min_time
-    if max_time:
-        params["timeMax"] = max_time
+    if timeMin:
+        params["timeMin"] = timeMin
+    if timeMax:
+        params["timeMax"] = timeMax
 
     try:
         events_result = service.events().list(**params).execute()
@@ -77,7 +77,7 @@ def search_events(
         if not events:
             return ["No events found."]
 
-        user_tz = pytz.timezone(get_user_timezone())
+        user_tz = pytz.timezone(str(get_user_timezone()))
         events_formatted = []
         for event in events:
             start = event['start'].get('dateTime', event['start'].get('date'))
@@ -95,7 +95,7 @@ def search_events(
 
 def list_events(max_results: int = 10):
     current_time = datetime.datetime.now(tz = pytz.UTC).isoformat()
-    return search_events(min_time=current_time, max_results=max_results)
+    return search_events(timeMin=current_time, max_results=max_results)
 
 def natural_language_datetime_parser(datetime_str: str, duration: Optional[str] = None, prefered_time: Optional[str] = None) -> tuple[str, str, Optional[tuple[datetime.time, datetime.time]]]:
     '''
@@ -110,13 +110,13 @@ def natural_language_datetime_parser(datetime_str: str, duration: Optional[str] 
     Returns:
     Tuple of (start_datetime, end_time, time_frame) in ISO 8601 UTC and optional (start_time, end_time).
     '''
-    user_timezone = get_user_timezone()
+    user_timezone = str(get_user_timezone())
     settings = {
         'TIMEZONE': user_timezone,
         'TO_TIMEZONE': 'UTC',
         'RETURN_AS_TIMEZONE_AWARE': True,
         'PREFER_DATES_FROM': 'future',
-        'DATE_OREDR': 'DMY',
+        'DATE_ORDER': 'DMY',
         'STRICT_PARSING': False
     }
 
@@ -142,7 +142,7 @@ def natural_language_datetime_parser(datetime_str: str, duration: Optional[str] 
 
     parsed_datetime = dateparser.parse(
         datetime_str,
-        language = ['en'],
+        languages = ['en'],
         settings = settings
     )
 
@@ -182,7 +182,7 @@ def natural_language_datetime_parser(datetime_str: str, duration: Optional[str] 
                 try:
                     time_parsed = dateutil_parser.parse(time_part, fuzzy=True)
                     parsed_datetime = target_date.replace(
-                        hours = time_parsed.hour,
+                        hour = time_parsed.hour,
                         minute = time_parsed.minute,
                         second = 0,
                         microsecond = 0
@@ -192,7 +192,7 @@ def natural_language_datetime_parser(datetime_str: str, duration: Optional[str] 
 
             else:
                 parsed_datetime = target_date.replace(
-                    hours = default_hour,
+                    hour = default_hour,
                     minute = 0,
                     second = 0,
                     microsecond = 0
@@ -200,9 +200,19 @@ def natural_language_datetime_parser(datetime_str: str, duration: Optional[str] 
 
     if not parsed_datetime:
         try:
-           # Fallback to dateutil id above doesn't works for general parsing
-           parsed_datetime = dateutil_parser.parse(datetime_str, fuzzy=True) 
-           parsed_datetime = pytz.timezone(user_timezone).localize(parsed_datetime)       
+            # Fallback to dateutil if above doesn't work for general parsing
+            parsed_datetime = dateutil_parser.parse(datetime_str, fuzzy=True)
+
+            # Ensure the datetime is timezone-aware
+            if isinstance(user_timezone, str):
+                # if user_timezone is a string, use pytz
+                tz = pytz.timezone(user_timezone)
+            else:
+                # if user_timezone is zoneinfo.ZoneInfo, just use it
+                tz = user_timezone
+
+            parsed_datetime = parsed_datetime.replace(tzinfo=tz)
+
         except ValueError:
             raise ValueError(f"Could not parse datetime string {datetime_str}")
     '''
@@ -216,10 +226,10 @@ def natural_language_datetime_parser(datetime_str: str, duration: Optional[str] 
     start_time = parsed_datetime.isoformat().replace('+00:00', 'Z') # 2026-03-05T20:00:00+00:00 -> 2026-03-05T20:00:00Z for the Google API
 
     if duration:
-        duration_minutes = parsed_duration(duration)
+        duration_minutes = parse_duration(duration)
         end_time = (parsed_datetime + datetime.timedelta(minutes=duration_minutes))
     else:
-        end_time = (parsed_datetime + datetime.timedelta(hours = 1)).isoformat().replace('+00:00', 'Z')
+        end_time = (parsed_datetime + datetime.timedelta(hour = 1)).isoformat().replace('+00:00', 'Z')
 
     return start_time, end_time, time_frame
 
@@ -236,10 +246,10 @@ def parse_duration(duration: str) -> int:
     Error Raised: 
         ValueError: If duration does not parse.
     '''
-    duration_match = re.match(r'(?:for\s+)?(\d+)\s*(hour|hours|minute|minutes)', duration, re.IGNORECASE)
+    duration_match = re.match(r'(?:for\s+)?(\d+)\s*(hour|hour|minute|minutes)', duration, re.IGNORECASE)
     if duration_match:
         value, unit = duration_match.groups()
-        value = value.int()
+        value = int(value)
         return value * 60 if unit.lower().startswith('hour') else value
     raise ValueError(f"Could not parse duration string: {duration}")
 
@@ -251,9 +261,9 @@ def create_event(
     location: str = "",
     description: str = "",
     recurrence: Optional[str] = None,
-    attendees: Optional[List[str, str]] = None
+    attendees: Optional[List[Dict[str, str]]] = None
 ):
-    user_timezone = get_user_timezone()
+    user_timezone = str(get_user_timezone())
     service = get_calendar_service()
     event = {
         "summary": summary,
@@ -327,7 +337,7 @@ def update_event(
     location: str = "",
     description: str = "",
     recurrence: Optional[str] = None,
-    attendees: Optional[List[str, str]] = None,
+    attendees: Optional[List[Dict[str, str]]] = None,
     calendar_id: str = "primary",
     send_update: str = "None" # "externalOnly", "all", "none"
 ) -> str:
@@ -399,7 +409,7 @@ def meeting_time_suggestions(
         '''
 
     service = get_calendar_service()
-    user_timezone = get_user_timezone()
+    user_timezone = str(get_user_timezone())
     user_tz = pytz.timezone(user_timezone)
 
     # parse the date, time and duration
@@ -420,8 +430,8 @@ def meeting_time_suggestions(
     #Query for free/bust status
 
     body = {
-        "minTime": day_start.astimezone(pytz.UTC).isoformat(),
-        "maxTime": day_end.astimezone(pytz.UTC).isoformat(),
+        "timeMin": day_start.astimezone(pytz.UTC).isoformat(),
+        "timeMax": day_end.astimezone(pytz.UTC).isoformat(),
         "items": [{"id": calendar_id}]
     }
 
@@ -468,7 +478,7 @@ You are a helpful, intelegent and precise calendar assistant that operates in th
 
 Event Search and Querying Instructions:
 When the user asks to search or query events:
-- Use 'search_events' with query that contains keywords, min_time/max_time (parsed via 'natural_language_datetime_parser')
+- Use 'search_events' with query that contains keyword, timemin/timemax (parsed via 'natural_language_datetime_parser')
 - Display results in local TZ, including event ID for reference
 - If no results are found, say so politely.
 - for the resulting events use 'list_events'.
@@ -521,10 +531,17 @@ General Instructions:
 
 agent = Agent(
     model = MODEL,
-    name = "google-calendar-event-agent",
+    name = "google_calendar_event_agent",
     description = "An intelligent assistant that lets you manage your Google Calendar using plain language, including scheduling recurring meetings with attendees, editing or removing events, searching your calendar, and proposing suitable meeting times in your local time zone." + agent_instructions,
-    generate_content_config = types.generateContentConfig(temperature = 0.2),
-    tools = [search_events, list_events, natural_language_datetime_parser, create_event, get_event, delete_event, parsed_recurrence, meeting_time_suggestions]
+    generate_content_config = types.GenerateContentConfig(temperature = 0.2),
+    tools = [search_events, 
+             list_events, 
+             natural_language_datetime_parser, 
+             create_event, 
+             get_event, 
+             delete_event, 
+             parsed_recurrence, 
+             meeting_time_suggestions]
 )
 
 
