@@ -15,7 +15,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.genai import types
 from google.adk.agents import Agent
 
-MODEL = "gemini-2.0-flash-001"
+MODEL = "gemini-2.5-flash" #free model #"gemini-2.0-flash-001" (non free)
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 def get_calendar_service(): #for connection with google calendar
