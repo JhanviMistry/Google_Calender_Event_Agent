@@ -5,6 +5,7 @@ from dateutil import parser as dateutil_parser
 import dateparser
 import pytz
 from tzlocal import get_localzone
+from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict
 
 from google.auth.transport.requests import Request
@@ -24,7 +25,7 @@ def get_calendar_service(): #for connection with google calendar
         try:
            creds = Credentials.from_authorized_user_file("token.json", SCOPES)
         except (UnicodeDecodeError, ValueError):
-            print("Warning: 'token.json has an encoding issue or is invalid'")
+            print("Warning: 'token.json' has an encoding issue or is invalid. Attempting to re-authorize.")
             os.remove("token.json")
 
     if not creds or not creds.valid:
@@ -40,13 +41,13 @@ def get_calendar_service(): #for connection with google calendar
     return build("calendar", "v3", credentials = creds) #creates and returns calendar API service
         
 
-#detect user's timezone if not detected return GMT (Greenwich Mean Time)  
+#detect user's timezone if not detected return 'Europe/London', if detection fails.  
 def get_user_timezone() -> str:
     try:
         return get_localzone()
     except Exception as e:
-        print("Warning: ould not detect local time zone ({str(e)}). Falling back to GMT.")
-        return "GMT"
+        print(f"Warning: Could not detect local time zone ({str(e)}). Falling back to 'Europe/London'.")
+        return "Europe/London"
     
 
 def search_events(
